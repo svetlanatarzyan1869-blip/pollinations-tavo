@@ -1,0 +1,8 @@
+{
+  "name": "linkapi-proxy-imgbb-key",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "^5.10.1"
+  }
+}
