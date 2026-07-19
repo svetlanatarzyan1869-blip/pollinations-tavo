@@ -1,9 +1,10 @@
 // ═══════════════════════════════════════════════════════════════
-// NAISTERA PROXY для Tavo — генерация картинок через naistera.org
-// База: твой картиночный прокси (расшифровка DATA, ImgBB, кэш, реролл, SVG-ошибки).
-// API Naistera: POST /api/generate, Bearer <токен>, reference_images = массив data URL (до 5),
-// ответ { data_url: "data:image/png;base64,..." }.
-// Модели с рефами: "nano banana 2" (дефолт), "grok". БЕЗ рефов: "novelai", "grok-pro".
+// POLLINATIONS PROXY для Tavo — генерация картинок через gen.pollinations.ai
+// База: тот же картиночный прокси (расшифровка DATA, ImgBB, кэш, реролл, SVG-ошибки).
+// API Pollinations: GET /image/{prompt}?model=&width=&height=&seed=-1
+//   Auth: Authorization: Bearer <key> (ключ обязателен даже для free-тира).
+//   Ответ — бинарная картинка (image/jpeg|png). Реф-картинки НЕ используем (free-модели их не поддерживают).
+// Free-модели (обычный текст, наш каталог стилей работает): flux, zimage.
 // ═══════════════════════════════════════════════════════════════
 
 import { createRequire } from 'module';
@@ -14,7 +15,7 @@ import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
 
-export const maxDuration = 300;
+export const maxDuration = 60; // Vercel Hobby всё равно режет на 60с — держим таймауты ниже этого
 
 // ---------- SVG-ошибка ----------
 function errorSvg(res, title, advice) {
@@ -286,18 +287,17 @@ export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).end();
 
   try {
-    console.log('🚀 [2/9] Начало запроса');
+    console.log('🚀 [2/9] Начало запроса (Pollinations)');
     console.log('🔍 RAW data:', req.query.data?.slice(0, 80));
 
     const encryptionKey = process.env.ENCRYPTION_KEY;
-    let key, charactersRaw, imgbb_key;
+    let key, imgbb_key;
 
     if (req.query.data && encryptionKey) {
       const decrypted = decryptData(req.query.data, encryptionKey);
       if (decrypted && typeof decrypted === 'object') {
         key = decrypted.key;
         imgbb_key = decrypted.imgbb_key;
-        charactersRaw = decrypted.characters || req.query.characters;
         console.log('✅ [3/9] Данные расшифрованы');
       } else {
         console.error('❌ [3/9] Ошибка расшифровки');
@@ -305,41 +305,30 @@ export default async function handler(req, res) {
       }
     } else {
       key = req.query.key;
-      charactersRaw = req.query.characters;
       imgbb_key = req.query.imgbb_key;
       console.log('⚠️ [3/9] Незашифрованный запрос');
     }
 
-    // Чистим ключи от «умных» символов (автозамена телефона: – — → -, неразрывные пробелы, кавычки)
-    // и от любых non-ASCII, чтобы не падал HTTP-заголовок Authorization (ByteString ошибка)
     function sanitizeKey(k){
       if (!k || typeof k !== 'string') return k;
       return k
-        .replace(/[\u2010-\u2015\u2212]/g, '-')   // разные тире/минусы → дефис
-        .replace(/[\u2018\u2019\u201C\u201D]/g, '') // умные кавычки → убрать
-        .replace(/[\u00A0\u2000-\u200B]/g, '')      // неразрывные/тонкие пробелы → убрать
-        .replace(/[^\x00-\x7F]/g, '')               // всё остальное не-ASCII → убрать
+        .replace(/[‐-―−]/g, '-')
+        .replace(/[‘’“”]/g, '')
+        .replace(/[  -​]/g, '')
+        .replace(/[^\x00-\x7F]/g, '')
         .trim();
     }
     key = sanitizeKey(key);
     imgbb_key = sanitizeKey(imgbb_key);
 
-    if (charactersRaw && typeof charactersRaw === 'string' && charactersRaw.includes('%')) {
-      try {
-        charactersRaw = decodeURIComponent(charactersRaw);
-        console.log('🔓 characters decoded');
-      } catch (e) { console.warn('Decode failed', e.message); }
-    }
-    console.log('🔍 charactersRaw:', charactersRaw);
-
     const userId = req.query.userId;
     const prompt = req.query.prompt;
     const style = req.query.style;
-    const model = req.query.model || 'gemini-3.1-flash-image-preview';
+    const model = req.query.model || 'flux';
 
     if (!key || !prompt || !userId) {
       console.error(`❌ 400: key=${!!key}, prompt=${!!prompt}, userId=${!!userId}`);
-      return errorSvg(res, 'Неполная конфигурация', 'Отсутствует ключ, промт или userId. Перешифруй данные на сайте настройки');
+      return errorSvg(res, 'Неполная конфигурация', 'Отсутствует ключ Pollinations, промт или userId. Перешифруй данные на сайте настройки');
     }
     if (!imgbb_key) {
       console.error('❌ 400: imgbb_key missing');
@@ -347,75 +336,65 @@ export default async function handler(req, res) {
     }
     console.log(`✅ [3/9] userId: ${userId}, model: ${model}`);
 
-    // Стиль: ключ из каталога → его описание; иначе произвольный текст юзера как есть;
-    // иначе дефолт. Лимит — чтобы длинное полотно не съедало таймаут генерации.
+    // Стиль: ключ каталога → описание; иначе произвольный текст как есть; иначе дефолт.
     const MAX_STYLE_LEN = 300;
+    // Нормализация ключа стиля: "Kodak Portra 400", "Kodak-Portra-400", " KODAK PORTRA 400 "
+    // → "kodak_portra_400". Без этого любая мелкая опечатка/другой регистр молча
+    // уезжали как «кастомный стиль» вместо стиля из каталога.
+    function normStyleKey(s){
+      return String(s || '').trim().toLowerCase()
+        .replace(/[\s\-]+/g, '_')     // пробелы и дефисы → подчёркивание
+        .replace(/[^a-z0-9_]/g, '')    // остальное убираем
+        .replace(/_+/g, '_')
+        .replace(/^_|_$/g, '');
+    }
     let finalStyle;
-    if (style && styleMap[style.toLowerCase()]) {
-      finalStyle = styleMap[style.toLowerCase()];
-      console.log(`🎨 [4/9] Стиль "${style}" заменён`);
+    const styleKey = normStyleKey(style);
+    if (styleKey && styleMap[styleKey]) {
+      finalStyle = styleMap[styleKey];
+      console.log(`🎨 [4/9] Стиль "${style}" → каталог "${styleKey}"`);
     } else if (style && style.trim()) {
       finalStyle = style.trim().slice(0, MAX_STYLE_LEN);
       console.log(`🎨 [4/9] Кастомный стиль (${finalStyle.length} симв.)`);
     } else {
-      const defaultStyle = 'kodak_portra_400';
-      finalStyle = styleMap[defaultStyle] || "Kodak Portra 400 film look";
-      console.log(`🎨 [4/9] Стиль по умолчанию (${defaultStyle})`);
+      finalStyle = styleMap['kodak_portra_400'] || 'Kodak Portra 400 film look';
+      console.log('🎨 [4/9] Стиль по умолчанию');
     }
 
-    // ---- Парсим персонажей заранее для замены generic-слов ----
+    // Персонажи (для замены generic-слов на имена). Референсы Pollinations free НЕ поддерживает.
     let chars = [];
-    try {
-      chars = JSON.parse(charactersRaw || '[]');
-      console.log(`📸 [6/9] Референсов: ${chars.length}`);
-    } catch(e) {
-      console.warn('Ошибка парсинга characters:', e.message);
-    }
-
-    // Заменяем generic-слова на имена персонажей
+    try { chars = JSON.parse(req.query.characters || '[]'); } catch(e) {}
     const cleanPrompt = replaceGenericWords(prompt, chars);
+    const fullPrompt = `${finalStyle}\n\n${cleanPrompt}`;
 
-    // ---- Модель и поддержка референсов ----
-    const NAISTERA_REF_MODELS = ['nano banana 2', 'grok'];   // рефы работают только тут
-    const naisteraModel = (model && String(model).trim()) || 'nano banana 2';
-    const refsSupported = NAISTERA_REF_MODELS.includes(naisteraModel.toLowerCase());
-    const aspectRatio = (req.query.aspect_ratio || req.query.aspectRatio || '3:2');
+    // Соотношение сторон → пиксели. Длинная сторона 1024 — меньше пикселей = быстрее генерация
+    // (важно на free-очереди Pollinations + лимите Vercel Hobby в 60с).
+    const AR = {
+      '1:1':  [1024,1024], '3:2': [1024,688], '2:3': [688,1024],
+      '16:9': [1024,576],  '9:16':[576,1024], '4:3': [1024,768], '3:4': [768,1024]
+    };
+    const ar = (req.query.aspect_ratio || req.query.aspectRatio || '1:1');
+    const [w, h] = AR[ar] || AR['1:1'];
 
-    // Жёсткая инструкция: точное соответствие лиц референсам.
-    // Только когда рефы реально уйдут в запрос — иначе модель (novelai/grok-pro)
-    // получает указание копировать несуществующие картинки.
-    let faceLock = '';
-    const named = chars.filter(c => c && c.name && c.url).map(c => c.name);
-    if (refsSupported && named.length > 0) {
-      faceLock = `[CRITICAL: The reference image(s) show the EXACT appearance of ${named.join(' and ')}. You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]\n\n`;
-    }
-    const fullPrompt = `${faceLock}${finalStyle}\n\n${cleanPrompt}`;
-
-    // ---- Кэш и блокировка ----
-    // Каждый реролл кэшируется ОТДЕЛЬНО — по своему _r. Это принципиально:
-    // в историю на клиенте сохраняется именно этот URL (с _r), и при листании
-    // рероллов он запрашивается снова. Раньше _r отключал кэш → каждое листание
-    // жгло токены заново. Теперь новый _r = новая генерация, повтор того же _r = кэш.
+    // ---- Кэш ----
+    // Каждый реролл кэшируется ОТДЕЛЬНО — по своему _r, и кэш читается ВСЕГДА.
+    // Иначе повторный запрос того же URL (листание истории рероллов) генерил бы заново и жёг кредиты.
     const rerollTag = String(req.query._r || '');
     const isReroll = !!rerollTag;
-    const cacheKey = getCacheKey(userId, prompt, charactersRaw, finalStyle + '|r=' + rerollTag);
-    let cachedUrl = null;
-    let lockAcquired = false;
+    const cacheKey = getCacheKey(userId, prompt, req.query.characters, finalStyle + '|' + model + '|' + ar + '|r=' + rerollTag);
+    let cachedUrl = null, lockAcquired = false;
     const lockKey = `lock:${cacheKey}`;
-
     if (redis) {
       console.log('🔄 [5/9] Проверка кэша...');
       try { cachedUrl = await redis.get(cacheKey); } catch(e) { console.warn('Redis error:', e.message); }
       if (!cachedUrl) {
         const locked = await redis.set(lockKey, 'locked', 'EX', 2, 'NX');
-        if (locked) {
-          lockAcquired = true;
-          console.log(`🔒 Блокировка получена`);
-        } else {
-          console.log(`⏳ Ожидание блокировки`);
-          await new Promise(resolve => setTimeout(resolve, 600));
-          const retryCache = await redis.get(cacheKey);
-          if (retryCache) return res.redirect(302, retryCache);
+        if (locked) { lockAcquired = true; console.log('🔒 Блокировка получена'); }
+        else {
+          console.log('⏳ Ожидание блокировки');
+          await new Promise(r => setTimeout(r, 600));
+          const retry = await redis.get(cacheKey);
+          if (retry) return res.redirect(302, retry);
           else await redis.del(lockKey);
         }
       }
@@ -423,61 +402,74 @@ export default async function handler(req, res) {
     if (cachedUrl) return res.redirect(302, cachedUrl);
     console.log(isReroll ? '🔁 [5/9] Генерация (реролл)' : '❌ [5/9] Кэш промах, генерация');
 
-    console.log(`🤖 [7/9] Запрос в Naistera (${naisteraModel}, ${aspectRatio})...`);
+    // ---- Запрос в Pollinations ----
+    // Seed выводим из _r детерминированно: один и тот же реролл → тот же seed
+    // (значит и та же картинка, даже если запись кэша успела истечь).
+    let seed = 0;
+    if (rerollTag) { for (let i = 0; i < rerollTag.length; i++) seed = (seed * 31 + rerollTag.charCodeAt(i)) % 2147483647; }
+    const pollUrl = `https://gen.pollinations.ai/image/${encodeURIComponent(fullPrompt)}`
+      + `?model=${encodeURIComponent(model)}`
+      + `&width=${w}&height=${h}&seed=${seed}`;
+    console.log(`🤖 [7/9] Запрос в Pollinations (${model}, ${w}x${h}, seed=${seed})...`);
 
-    // ---- Референсы: скачиваем с ImgBB → data URL (Naistera ждёт именно data URL) ----
-    const referenceImages = [];
-    if (refsSupported) {
-      for (const c of chars) {
-        if (!c.url) continue;
-        if (referenceImages.length >= 5) { console.log('   ⚠️ лимит 5 референсов достигнут'); break; }
-        try {
-          const { buf, contentType } = await fetchImageBuffer(c.url);
-          referenceImages.push(`data:${contentType};base64,${buf.toString('base64')}`);
-          console.log(`   ✅ "${c.name}" загружен (${buf.length} bytes)`);
-        } catch(e) { console.warn(`   ⚠️ "${c.name}": ${e.message}`); }
+    // Бюджет времени: Vercel Hobby убивает функцию на 60с. Оставляем ~10с на ImgBB и накладные,
+    // значит на генерацию Pollinations даём максимум ~46с и прерываем сами — с понятной ошибкой,
+    // а не «бесконечной загрузкой» после того, как Vercel молча прибьёт функцию.
+    const POLL_BUDGET_MS = 46000;
+    const t0 = Date.now();
+    let imgRes, lastErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const remaining = POLL_BUDGET_MS - (Date.now() - t0);
+      if (remaining < 4000) break; // времени на ещё одну попытку нет
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), remaining);
+      try {
+        imgRes = await fetch(pollUrl, { headers: { Authorization: `Bearer ${key}`, Accept: 'image/*' }, signal: ac.signal });
+      } catch (netErr) {
+        clearTimeout(timer);
+        if (netErr && netErr.name === 'AbortError') {
+          console.error(`⏱️ Таймаут Pollinations (${Date.now()-t0}ms) — free-очередь слишком медленная`);
+          return errorSvg(res, 'Pollinations не успел за 60 секунд', 'Free-очередь сейчас перегружена. Нажми Реролл ещё раз, попробуй позже или выбери другую модель (flux/zimage быстрее).');
+        }
+        lastErr = new Error(`Network error: ${netErr.message}`);
+        console.error(`❌ Network attempt ${attempt}/3: ${netErr.message}`);
+        if (attempt < 3 && (POLL_BUDGET_MS - (Date.now() - t0)) > 8000) { await new Promise(r => setTimeout(r, 1200)); continue; }
+        break;
       }
-    } else {
-      console.log(`   ℹ️ Модель "${naisteraModel}" не поддерживает референсы — пропускаем`);
+      clearTimeout(timer);
+      if (imgRes.ok) break;
+      const errText = await imgRes.text();
+      console.error(`❌ Pollinations attempt ${attempt}/3 — HTTP ${imgRes.status}: ${errText.slice(0,400)}`);
+      lastErr = new Error(friendlyError(`Pollinations HTTP ${imgRes.status}: ${errText}`));
+      if (imgRes.status === 401 || imgRes.status === 403)
+        return errorSvg(res, 'Неверный или просроченный ключ Pollinations', 'Проверь ключ на enter.pollinations.ai/keys и перешифруй данные на сайте');
+      if (imgRes.status === 402 || /pollen|credit|insufficient/i.test(errText))
+        return errorSvg(res, 'Закончились кредиты Pollinations', 'Пополни баланс на enter.pollinations.ai или выполни квесты для бесплатных pollen');
+      if (imgRes.status !== 502 && imgRes.status !== 503 && imgRes.status !== 429) break;
+      if (attempt < 3 && (POLL_BUDGET_MS - (Date.now() - t0)) > 8000) await new Promise(r => setTimeout(r, 1500));
     }
+    if (!imgRes || !imgRes.ok) throw lastErr || new Error('Pollinations недоступен');
+    console.log(`⏱️ Pollinations генерация: ${Date.now()-t0}ms`);
 
-    // ---- Тело запроса ----
-    const naisteraBody = {
-      prompt: fullPrompt,
-      aspect_ratio: aspectRatio,
-      model: naisteraModel,
-    };
-    if (referenceImages.length > 0) naisteraBody.reference_images = referenceImages;
-
-    const naisteraRes = await fetchWithRetry('https://naistera.org/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify(naisteraBody),
-    });
-    const naisteraData = await naisteraRes.json();
-    console.log('🔍 Naistera response keys:', JSON.stringify(Object.keys(naisteraData)));
-
-    // ---- Ответ: { data_url: "data:image/png;base64,..." } ----
-    let b64 = null;
-    if (naisteraData.data_url && typeof naisteraData.data_url === 'string') {
-      const m = naisteraData.data_url.match(/base64,([a-zA-Z0-9+/=]+)/);
-      if (m) b64 = m[1];
+    const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+    if (!contentType.startsWith('image/')) {
+      const bodyText = Buffer.from(await imgRes.arrayBuffer()).toString('utf8').slice(0, 400);
+      console.error('❌ Не картинка от Pollinations:', bodyText);
+      throw new Error(friendlyError(bodyText || 'Pollinations вернул не изображение'));
     }
-    if (!b64) {
-      const rawMsg = naisteraData.error || naisteraData.message || JSON.stringify(naisteraData).slice(0, 400);
-      console.error('❌ Full Naistera response:', JSON.stringify(naisteraData).slice(0, 1500));
-      throw new Error(friendlyError(rawMsg));
-    }
-    console.log('✅ [7/9] Naistera ответила');
+    const buf = Buffer.from(await imgRes.arrayBuffer());
+    const b64 = buf.toString('base64');
+    console.log(`✅ [7/9] Pollinations ответил (${buf.length} bytes)`);
+
+    const tImg = Date.now();
     const imageUrl = await uploadToImgBB(imgbb_key, b64);
-
-    console.log(`✅ [8/9] Изображение готово`);
+    console.log(`✅ [8/9] Изображение готово (ImgBB: ${Date.now()-tImg}ms)`);
 
     if (redis) {
       try {
         await redis.set(cacheKey, imageUrl, 'EX', 604800);
         if (lockAcquired) await redis.del(lockKey);
-        console.log(`💾 [9/9] Сохранено в кэш`);
+        console.log('💾 [9/9] Сохранено в кэш');
       } catch(e) { console.warn('Redis set error:', e.message); }
     }
 
