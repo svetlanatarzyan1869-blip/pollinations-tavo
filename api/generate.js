@@ -211,11 +211,13 @@ if (redisUrl) {
   redis.on('error', (err) => console.warn('Redis warning:', err.message));
 }
 
-function getCacheKey(userId, prompt, characters, style) {
+function getCacheKey(userId, prompt, characters, style, legacy) {
   let chars = [];
   try { chars = JSON.parse(characters || '[]'); chars.sort((a,b)=>a.name.localeCompare(b.name)); } catch(e) {}
-  const hash = Buffer.from(JSON.stringify({ userId, prompt, characters: chars, style })).toString('base64');
-  return `img:${hash}`;
+  const json = JSON.stringify({ userId, prompt, characters: chars, style });
+  // legacy — прежний формат (base64 с открытым текстом), только для чтения старых записей
+  if (legacy) return `img:${Buffer.from(json).toString('base64')}`;
+  return `img2:${crypto.createHash('sha256').update(json).digest('hex')}`;
 }
 
 async function fetchImageBuffer(url) {
@@ -302,20 +304,21 @@ async function fetchWithRetry(url, options, retries = 3, delay = 1500) {
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'GET') return res.status(405).end();
+  if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
+  // Новые плагины шлют POST с JSON — тогда DATA и текст сцены не попадают в адрес и логи запросов.
+  const Q = Object.assign({}, req.query || {}, (req.method === 'POST' && req.body && typeof req.body === 'object') ? req.body : {});
 
   try {
     console.log('🚀 [2/9] Начало запроса (Pollinations)');
-    console.log('🔍 RAW data:', req.query.data?.slice(0, 80));
 
     const encryptionKey = process.env.DATA_KEY || process.env.ENCRYPTION_KEY;
     let key, imgbb_key;
 
-    if (req.query.data && encryptionKey) {
-      const decrypted = openData(req.query.data);
+    if (Q.data && encryptionKey) {
+      const decrypted = openData(Q.data);
       if (decrypted && typeof decrypted === 'object') {
         key = decrypted.key;
         imgbb_key = decrypted.imgbb_key;
@@ -325,9 +328,8 @@ export default async function handler(req, res) {
         return errorSvg(res, 'Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
       }
     } else {
-      key = req.query.key;
-      imgbb_key = req.query.imgbb_key;
-      console.log('⚠️ [3/9] Незашифрованный запрос');
+      console.error('❌ [3/9] Нет DATA');
+      return errorSvg(res, 'Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
     }
 
     function sanitizeKey(k){
@@ -342,10 +344,10 @@ export default async function handler(req, res) {
     key = sanitizeKey(key);
     imgbb_key = sanitizeKey(imgbb_key);
 
-    const userId = req.query.userId;
-    const prompt = req.query.prompt;
-    const style = req.query.style;
-    const model = req.query.model || 'flux';
+    const userId = Q.userId;
+    const prompt = Q.prompt;
+    const style = Q.style;
+    const model = Q.model || 'flux';
 
     if (!key || !prompt || !userId) {
       console.error(`❌ 400: key=${!!key}, prompt=${!!prompt}, userId=${!!userId}`);
@@ -384,7 +386,7 @@ export default async function handler(req, res) {
 
     // Персонажи (для замены generic-слов на имена). Референсы Pollinations free НЕ поддерживает.
     let chars = [];
-    try { chars = JSON.parse(req.query.characters || '[]'); } catch(e) {}
+    try { chars = JSON.parse(Q.characters || '[]'); } catch(e) {}
     const cleanPrompt = replaceGenericWords(prompt, chars);
     const fullPrompt = `${finalStyle}\n\n${cleanPrompt}`;
 
@@ -394,20 +396,21 @@ export default async function handler(req, res) {
       '1:1':  [1024,1024], '3:2': [1024,688], '2:3': [688,1024],
       '16:9': [1024,576],  '9:16':[576,1024], '4:3': [1024,768], '3:4': [768,1024]
     };
-    const ar = (req.query.aspect_ratio || req.query.aspectRatio || '1:1');
+    const ar = (Q.aspect_ratio || Q.aspectRatio || '1:1');
     const [w, h] = AR[ar] || AR['1:1'];
 
     // ---- Кэш ----
     // Каждый реролл кэшируется ОТДЕЛЬНО — по своему _r, и кэш читается ВСЕГДА.
     // Иначе повторный запрос того же URL (листание истории рероллов) генерил бы заново и жёг кредиты.
-    const rerollTag = String(req.query._r || '');
+    const rerollTag = String(Q._r || '');
     const isReroll = !!rerollTag;
-    const cacheKey = getCacheKey(userId, prompt, req.query.characters, finalStyle + '|' + model + '|' + ar + '|r=' + rerollTag);
+    const cacheKey = getCacheKey(userId, prompt, Q.characters, finalStyle + '|' + model + '|' + ar + '|r=' + rerollTag);
+    const legacyCacheKey = getCacheKey(userId, prompt, Q.characters, finalStyle + '|' + model + '|' + ar + '|r=' + rerollTag, true);
     let cachedUrl = null, lockAcquired = false;
     const lockKey = `lock:${cacheKey}`;
     if (redis) {
       console.log('🔄 [5/9] Проверка кэша...');
-      try { cachedUrl = await redis.get(cacheKey); } catch(e) { console.warn('Redis error:', e.message); }
+      try { cachedUrl = (await redis.get(cacheKey)) || (await redis.get(legacyCacheKey)); } catch(e) { console.warn('Redis error:', e.message); }
       if (!cachedUrl) {
         const locked = await redis.set(lockKey, 'locked', 'EX', 2, 'NX');
         if (locked) { lockAcquired = true; console.log('🔒 Блокировка получена'); }
