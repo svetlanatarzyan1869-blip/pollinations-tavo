@@ -239,9 +239,9 @@ function openData(data) {
 let styleMap = {};
 try {
   styleMap = require('./styles.json');
-  console.log(`✅ [1/9] Загружено стилей: ${Object.keys(styleMap).length}`);
+  console.log(`🟢 старт функции (холодный): стилей ${Object.keys(styleMap).length}`); // вне запроса — поэтому БЕЗ номера шага
 } catch (err) {
-  console.error('❌ [1/9] styles.json error:', err.message);
+  console.error('❌ старт функции: не читается styles.json:', err.message);
   styleMap = { kodak_portra_400: "Kodak Portra 400 film look" };
 }
 
@@ -356,7 +356,7 @@ export default async function handler(req, res) {
   out.start(); // заголовки уходят ДО генерации — телефон видит, что сервер жив
 
   try {
-    console.log('🚀 [2/9] Начало запроса (Pollinations)');
+    console.log('🚀 [1/8] Начало запроса (Pollinations)');
 
     const encryptionKey = process.env.DATA_KEY || process.env.ENCRYPTION_KEY;
     let key, imgbb_key;
@@ -366,13 +366,13 @@ export default async function handler(req, res) {
       if (decrypted && typeof decrypted === 'object') {
         key = decrypted.key;
         imgbb_key = decrypted.imgbb_key;
-        console.log('✅ [3/9] Данные расшифрованы');
+        console.log('✅ [2/8] Данные расшифрованы');
       } else {
-        console.error('❌ [3/9] Ошибка расшифровки');
+        console.error('❌ [2/8] Ошибка расшифровки');
         return out.fail('Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
       }
     } else {
-      console.error('❌ [3/9] Нет DATA');
+      console.error('❌ [2/8] Нет DATA');
       return out.fail('Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
     }
 
@@ -401,7 +401,7 @@ export default async function handler(req, res) {
       console.error('❌ 400: imgbb_key missing');
       return out.fail('Отсутствует ImgBB ключ', 'Перешифруй данные, указав оба ключа');
     }
-    console.log(`✅ [3/9] userId: ${userId}, model: ${model}`);
+    console.log(`✅ [2/8] userId: ${userId}, model: ${model}`);
 
     // Стиль: ключ каталога → описание; иначе произвольный текст как есть; иначе дефолт.
     const MAX_STYLE_LEN = 300;
@@ -419,13 +419,13 @@ export default async function handler(req, res) {
     const styleKey = normStyleKey(style);
     if (styleKey && styleMap[styleKey]) {
       finalStyle = styleMap[styleKey];
-      console.log(`🎨 [4/9] Стиль "${style}" → каталог "${styleKey}"`);
+      console.log(`🎨 [3/8] Стиль "${style}" → каталог "${styleKey}"`);
     } else if (style && style.trim()) {
       finalStyle = style.trim().slice(0, MAX_STYLE_LEN);
-      console.log(`🎨 [4/9] Кастомный стиль (${finalStyle.length} симв.)`);
+      console.log(`🎨 [3/8] Кастомный стиль (${finalStyle.length} симв.)`);
     } else {
       finalStyle = styleMap['kodak_portra_400'] || 'Kodak Portra 400 film look';
-      console.log('🎨 [4/9] Стиль по умолчанию');
+      console.log('🎨 [3/8] Стиль по умолчанию');
     }
 
     // Персонажи (для замены generic-слов на имена). Референсы Pollinations free НЕ поддерживает.
@@ -453,7 +453,7 @@ export default async function handler(req, res) {
     let cachedUrl = null, lockAcquired = false;
     const lockKey = `lock:${cacheKey}`;
     if (redis) {
-      console.log('🔄 [5/9] Проверка кэша...');
+      console.log('🔄 [4/8] Проверка кэша...');
       try { cachedUrl = (await redis.get(cacheKey)) || (await redis.get(legacyCacheKey)); } catch(e) { console.warn('Redis error:', e.message); }
       if (!cachedUrl) {
         const locked = await redis.set(lockKey, 'locked', 'EX', 2, 'NX');
@@ -468,7 +468,7 @@ export default async function handler(req, res) {
       }
     }
     if (cachedUrl) return out.done(cachedUrl);
-    console.log(isReroll ? '🔁 [5/9] Генерация (реролл)' : '❌ [5/9] Кэш промах, генерация');
+    console.log(isReroll ? '🔁 [4/8] Генерация (реролл)' : '❌ [4/8] Кэш промах, генерация');
 
     // ---- Запрос в Pollinations ----
     // Seed выводим из _r детерминированно: один и тот же реролл → тот же seed
@@ -478,7 +478,7 @@ export default async function handler(req, res) {
     const pollUrl = `https://gen.pollinations.ai/image/${encodeURIComponent(fullPrompt)}`
       + `?model=${encodeURIComponent(model)}`
       + `&width=${w}&height=${h}&seed=${seed}`;
-    console.log(`🤖 [7/9] Запрос в Pollinations (${model}, ${w}x${h}, seed=${seed})...`);
+    console.log(`🤖 [6/8] Запрос в Pollinations (${model}, ${w}x${h}, seed=${seed})...`);
 
     // Бюджет времени: Vercel Hobby убивает функцию на 60с. Оставляем ~10с на ImgBB и накладные,
     // значит на генерацию Pollinations даём максимум ~46с и прерываем сами — с понятной ошибкой,
@@ -527,17 +527,17 @@ export default async function handler(req, res) {
     }
     const buf = Buffer.from(await imgRes.arrayBuffer());
     const b64 = buf.toString('base64');
-    console.log(`✅ [7/9] Pollinations ответил (${buf.length} bytes)`);
+    console.log(`✅ [6/8] Pollinations ответил (${buf.length} bytes)`);
 
     const tImg = Date.now();
     const imageUrl = await uploadToImgBB(imgbb_key, b64);
-    console.log(`✅ [8/9] Изображение готово (ImgBB: ${Date.now()-tImg}ms)`);
+    console.log(`✅ [7/8] Изображение готово (ImgBB: ${Date.now()-tImg}ms)`);
 
     if (redis) {
       try {
         await redis.set(cacheKey, imageUrl, 'EX', 604800);
         if (lockAcquired) await redis.del(lockKey);
-        console.log('💾 [9/9] Сохранено в кэш');
+        console.log('💾 [8/8] Сохранено в кэш');
       } catch(e) { console.warn('Redis set error:', e.message); }
     }
 
