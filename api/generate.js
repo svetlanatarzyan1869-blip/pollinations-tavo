@@ -15,9 +15,51 @@ import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
 
-export const maxDuration = 60; // Vercel Hobby всё равно режет на 60с — держим таймауты ниже этого
+export const maxDuration = 300; // проверено на боевом Vercel: функция живёт дольше 60с
 
 // ---------- SVG-ошибка ----------
+// ── Поток с «пульсом» (stream=1) ─────────────────────────────────────────────
+// Телефон (iOS) обрывает запрос, если за 60с от сервера не пришло НИ ОДНОГО байта,
+// а генерация столько идёт. Поэтому в этом режиме отвечаем 200 сразу, шлём строку
+// каждые 5с, а в конце — строку с готовой ссылкой. Формат: по JSON-объекту на строку.
+// Старые плагины (без stream=1) получают всё как раньше: 302 на картинку или SVG-ошибку.
+function makeResponder(res, Q) {
+  const on = String(Q.stream == null ? '' : Q.stream) === '1';
+  const t0 = Date.now();
+  let hb = null, started = false;
+  function write(obj) {
+    try { res.write(JSON.stringify(obj) + String.fromCharCode(10)); if (typeof res.flush === 'function') res.flush(); } catch (e) {}
+  }
+  function stop() { if (hb) { clearInterval(hb); hb = null; } }
+  return {
+    on,
+    // вызывается ДО долгой работы: заголовки уходят клиенту немедленно
+    start() {
+      if (!on || started) return;
+      started = true;
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Accel-Buffering', 'no'); // не копить ответ в буфере прокси
+      write({ t: 'start' });
+      hb = setInterval(() => write({ t: 'ping', s: Math.round((Date.now() - t0) / 1000) }), 5000);
+      if (hb && typeof hb.unref === 'function') hb.unref();
+    },
+    done(url) {
+      if (!on) return res.redirect(302, url);
+      stop(); write({ t: 'done', url: String(url), s: Math.round((Date.now() - t0) / 1000) });
+      return res.end();
+    },
+    fail(title, advice, retry, log) {
+      if (!on) return errorSvg(res, title, advice, retry, log); // errorSvg здесь берёт первые три
+      stop();
+      write({ t: 'error', title: String(title || ''), advice: String(advice || ''), retry: retry === false ? false : true,
+              log: (log && log.length) ? log.join(String.fromCharCode(10)).slice(-4000) : '' });
+      return res.end();
+    }
+  };
+}
+
 function errorSvg(res, title, advice) {
   const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // Перенос строк для совета
@@ -310,6 +352,8 @@ export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
   // Новые плагины шлют POST с JSON — тогда DATA и текст сцены не попадают в адрес и логи запросов.
   const Q = Object.assign({}, req.query || {}, (req.method === 'POST' && req.body && typeof req.body === 'object') ? req.body : {});
+  const out = makeResponder(res, Q);
+  out.start(); // заголовки уходят ДО генерации — телефон видит, что сервер жив
 
   try {
     console.log('🚀 [2/9] Начало запроса (Pollinations)');
@@ -325,11 +369,11 @@ export default async function handler(req, res) {
         console.log('✅ [3/9] Данные расшифрованы');
       } else {
         console.error('❌ [3/9] Ошибка расшифровки');
-        return errorSvg(res, 'Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
+        return out.fail('Ошибка расшифровки данных', 'Ключ шифрования не совпадает. Перешифруй ключи заново на сайте настройки и обнови DATA в промте');
       }
     } else {
       console.error('❌ [3/9] Нет DATA');
-      return errorSvg(res, 'Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
+      return out.fail('Плагин устарел', 'Пересоберите плагин на tavo-hub.vercel.app', false);
     }
 
     function sanitizeKey(k){
@@ -351,11 +395,11 @@ export default async function handler(req, res) {
 
     if (!key || !prompt || !userId) {
       console.error(`❌ 400: key=${!!key}, prompt=${!!prompt}, userId=${!!userId}`);
-      return errorSvg(res, 'Неполная конфигурация', 'Отсутствует ключ Pollinations, промт или userId. Перешифруй данные на сайте настройки');
+      return out.fail('Неполная конфигурация', 'Отсутствует ключ Pollinations, промт или userId. Перешифруй данные на сайте настройки');
     }
     if (!imgbb_key) {
       console.error('❌ 400: imgbb_key missing');
-      return errorSvg(res, 'Отсутствует ImgBB ключ', 'Перешифруй данные, указав оба ключа');
+      return out.fail('Отсутствует ImgBB ключ', 'Перешифруй данные, указав оба ключа');
     }
     console.log(`✅ [3/9] userId: ${userId}, model: ${model}`);
 
@@ -418,12 +462,12 @@ export default async function handler(req, res) {
           console.log('⏳ Ожидание блокировки');
           await new Promise(r => setTimeout(r, 600));
           const retry = await redis.get(cacheKey);
-          if (retry) return res.redirect(302, retry);
+          if (retry) return out.done(retry);
           else await redis.del(lockKey);
         }
       }
     }
-    if (cachedUrl) return res.redirect(302, cachedUrl);
+    if (cachedUrl) return out.done(cachedUrl);
     console.log(isReroll ? '🔁 [5/9] Генерация (реролл)' : '❌ [5/9] Кэш промах, генерация');
 
     // ---- Запрос в Pollinations ----
@@ -453,7 +497,7 @@ export default async function handler(req, res) {
         clearTimeout(timer);
         if (netErr && netErr.name === 'AbortError') {
           console.error(`⏱️ Таймаут Pollinations (${Date.now()-t0}ms) — free-очередь слишком медленная`);
-          return errorSvg(res, 'Pollinations не успел за 60 секунд', 'Free-очередь сейчас перегружена. Нажми Реролл ещё раз, попробуй позже или выбери другую модель (flux/zimage быстрее).');
+          return out.fail('Pollinations не успел за 60 секунд', 'Free-очередь сейчас перегружена. Нажми Реролл ещё раз, попробуй позже или выбери другую модель (flux/zimage быстрее).');
         }
         lastErr = new Error(`Network error: ${netErr.message}`);
         console.error(`❌ Network attempt ${attempt}/3: ${netErr.message}`);
@@ -466,9 +510,9 @@ export default async function handler(req, res) {
       console.error(`❌ Pollinations attempt ${attempt}/3 — HTTP ${imgRes.status}: ${errText.slice(0,400)}`);
       lastErr = new Error(friendlyError(`Pollinations HTTP ${imgRes.status}: ${errText}`));
       if (imgRes.status === 401 || imgRes.status === 403)
-        return errorSvg(res, 'Неверный или просроченный ключ Pollinations', 'Проверь ключ на enter.pollinations.ai/keys и перешифруй данные на сайте');
+        return out.fail('Неверный или просроченный ключ Pollinations', 'Проверь ключ на enter.pollinations.ai/keys и перешифруй данные на сайте');
       if (imgRes.status === 402 || /pollen|credit|insufficient/i.test(errText))
-        return errorSvg(res, 'Закончились кредиты Pollinations', 'Пополни баланс на enter.pollinations.ai или выполни квесты для бесплатных pollen');
+        return out.fail('Закончились кредиты Pollinations', 'Пополни баланс на enter.pollinations.ai или выполни квесты для бесплатных pollen');
       if (imgRes.status !== 502 && imgRes.status !== 503 && imgRes.status !== 429) break;
       if (attempt < 3 && (POLL_BUDGET_MS - (Date.now() - t0)) > 8000) await new Promise(r => setTimeout(r, 1500));
     }
@@ -497,10 +541,10 @@ export default async function handler(req, res) {
       } catch(e) { console.warn('Redis set error:', e.message); }
     }
 
-    return res.redirect(302, imageUrl);
+    return out.done(imageUrl);
   } catch (err) {
     console.error('❌ Ошибка:', err.message);
     const fe = friendlyErrorObj(err.message);
-    return errorSvg(res, fe.title, fe.advice);
+    return out.fail(fe.title, fe.advice);
   }
 }
